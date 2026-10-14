@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Vivy</string>
+    <string name="accessibility_service_description">Enables Vivy AI Agent to perform precise taps, gestures, and navigation commands requested from your authorized PC dashboard.</string>
+</resources>

@@ -1,0 +1,101 @@
+# ========================
+# Vivy - AI Phone Controller
+# ========================
+
+
+# ai slop
+.claude
+.github/modernize/
+
+# ---- OS ----
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~
+
+# ---- IDE ----
+.vscode/
+.idea/
+*.iml
+*.ipr
+*.iws
+.project
+.classpath
+.settings/
+
+# ---- Environment / Secrets ----
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Android signing: the keystore and its passwords never go in git
+*.jks
+*.keystore
+keystore.properties
+key.properties
+!keystore.properties.example
+
+# ---- Node / React (desktop/src) ----
+node_modules/
+dist/
+.cache/
+.vite/
+*.tsbuildinfo
+*.local
+
+# ---- Rust / Cargo (desktop/src-tauri) ----
+target/
+**/*.rs.bk
+# Cargo.lock IS committed: this is an app, so builds should be reproducible.
+
+# ---- Tauri ----
+desktop/src-tauri/target/
+desktop/src-tauri/WixTools/
+desktop/src-tauri/icons/icon.ico.bak
+desktop/src-tauri/gen/
+
+# ---- Android (android/) ----
+android/.gradle/
+android/build/
+android/app/build/
+android/local.properties
+android/captures/
+android/.externalNativeBuild/
+android/.cxx/
+android/app/release/
+android/app/debug/
+android/.kotlin/
+*.hprof
+*.apk
+*.aab
+*.ap_
+*.dex
+*.class
+*.jar
+*.aar
+# The Gradle wrapper must be committed so ./gradlew works after cloning.
+!gradle-wrapper.jar
+
+# ---- Logs ----
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# ---- Build outputs & Binaries ----
+*.exe
+*.msi
+*.dmg
+*.AppImage
+*.deb
+*.rpm
+releases/
+binaries/
+build_output/
+
