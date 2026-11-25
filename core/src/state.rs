@@ -4,10 +4,13 @@ use std::sync::Arc;
 use tokio::sync::{watch, Mutex};
 
 use crate::agent::permissions::PermissionManager;
+use crate::events::Events;
 use crate::phone::connection::PhoneManager;
 use crate::sessions::SessionStore;
 
 pub struct AppState {
+    /// Where progress goes: the desktop window or the terminal.
+    pub events: Events,
     pub phone: PhoneManager,
     pub permissions: PermissionManager,
     /// Master switch for the AI. When off, no task may start and any running one is killed.
@@ -22,12 +25,13 @@ pub struct AppState {
 }
 
 impl AppState {
-    pub fn new(phone: PhoneManager, permissions: PermissionManager) -> Self {
+    pub fn new(events: Events) -> Self {
         let (cancel_tx, _) = watch::channel(0u64);
         let (pause_tx, _) = watch::channel(false);
         Self {
-            phone,
-            permissions,
+            phone: PhoneManager::new(events.clone()),
+            permissions: PermissionManager::new(events.clone()),
+            events,
             agent_enabled: Arc::new(AtomicBool::new(true)),
             cancel_tx,
             pause_tx,
@@ -48,6 +52,37 @@ impl AppState {
     pub fn is_task_running(&self) -> bool {
         self.running_task_lock.try_lock().is_err()
     }
+
+    pub fn is_paused(&self) -> bool {
+        *self.pause_tx.borrow()
+    }
+
+    /// Accept phone connections on `port`. Call from inside a Tokio runtime.
+    pub fn start_phone_server(&self, port: u16) {
+        crate::phone::connection::start_websocket_server(self.phone.clone(), port);
+    }
+
+    /// Pause between actions so the user can use the phone by hand. Only takes
+    /// effect while a task runs. Returns the new state.
+    pub fn set_paused(&self, paused: bool) -> bool {
+        let paused = paused && self.is_task_running();
+        self.pause_tx.send_replace(paused);
+        self.events.emit("agent-paused", &paused);
+        paused
+    }
+
+    /// The master switch. Turning it off kills the running task on the spot,
+    /// denies any open permission prompt and forgets granted permissions.
+    pub async fn set_enabled(&self, enabled: bool) -> bool {
+        self.agent_enabled.store(enabled, Ordering::SeqCst);
+        if !enabled {
+            self.cancel_active_task();
+            self.permissions.cancel_pending().await;
+            self.permissions.revoke_all().await;
+        }
+        self.events.emit("agent-enabled-changed", &enabled);
+        enabled
+    }
 }
 
 pub fn get_local_lan_ip() -> String {
@@ -66,7 +101,7 @@ pub fn get_local_lan_ip() -> String {
     }
 
     // 2. Fallback: Query system hostname addresses
-    if let Ok(hostname) = std::env::var("COMPUTERNAME") {
+    if let Ok(hostname) = std::env::var("COMPUTERNAME").or_else(|_| std::env::var("HOSTNAME")) {
         use std::net::ToSocketAddrs;
         if let Ok(addrs) = format!("{}:0", hostname).to_socket_addrs() {
             for addr in addrs {

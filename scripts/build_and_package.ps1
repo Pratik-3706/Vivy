@@ -1,6 +1,6 @@
 # ==============================================================================
 # Vivy - Automation Build & Release Packaging Script
-# Compiles PC standalone .exe and Android .apk and places them into releases/
+# Compiles the PC app, the `vivy` terminal app and the Android .apk into releases/
 # ==============================================================================
 
 $ErrorActionPreference = "Stop"
@@ -9,15 +9,17 @@ $RootDir = Split-Path -Parent $PSScriptRoot
 $ReleasesDir = Join-Path $RootDir "releases"
 $PcReleaseDir = Join-Path $ReleasesDir "pc"
 $AndroidReleaseDir = Join-Path $ReleasesDir "android"
+$CliReleaseDir = Join-Path $ReleasesDir "cli"
 
 # Ensure directories exist
 New-Item -ItemType Directory -Path $PcReleaseDir -Force | Out-Null
 New-Item -ItemType Directory -Path $AndroidReleaseDir -Force | Out-Null
+New-Item -ItemType Directory -Path $CliReleaseDir -Force | Out-Null
 
 # =============================================================================
-# [1/3] Build PC Desktop Application
+# [1/4] Build PC Desktop Application
 # =============================================================================
-Write-Host "`n🚀 [1/3] Building PC Desktop Application (Vivy.exe)..." -ForegroundColor Cyan
+Write-Host "`n🚀 [1/4] Building PC Desktop Application (Vivy.exe)..." -ForegroundColor Cyan
 Set-Location (Join-Path $RootDir "desktop")
 
 # Clean the Rust package to force re-embedding icon resource
@@ -33,7 +35,8 @@ npm run build
 npm run tauri build
 
 # Locate compiled exe and copy to releases/pc/
-$TauriReleaseDir = Join-Path $RootDir "desktop/src-tauri/target/release"
+# The Cargo workspace builds everything into the root target/ folder.
+$TauriReleaseDir = Join-Path $RootDir "target/release"
 $CandidateExes = @(
     Join-Path $TauriReleaseDir "Vivy.exe",
     Join-Path $TauriReleaseDir "desktop.exe"
@@ -73,9 +76,23 @@ if (Test-Path $BundleDir) {
 }
 
 # =============================================================================
-# [2/3] Build Android APK
+# [2/4] Build the terminal app (vivy.exe)
 # =============================================================================
-Write-Host "`n📱 [2/3] Building Android APK (VivyAgent.apk)..." -ForegroundColor Cyan
+Write-Host "`n⌨️  [2/4] Building the terminal app (vivy.exe)..." -ForegroundColor Cyan
+Set-Location $RootDir
+cargo build --release -p vivy-cli
+$CliExe = Join-Path $RootDir "target/release/vivy.exe"
+if (Test-Path $CliExe) {
+    Copy-Item -Path $CliExe -Destination (Join-Path $CliReleaseDir "vivy.exe") -Force
+    Write-Host "✅ vivy.exe copied to: releases/cli/vivy.exe" -ForegroundColor Green
+} else {
+    Write-Host "⚠️ Could not find target/release/vivy.exe" -ForegroundColor Yellow
+}
+
+# =============================================================================
+# [3/4] Build Android APK
+# =============================================================================
+Write-Host "`n📱 [3/4] Building Android APK (VivyAgent.apk)..." -ForegroundColor Cyan
 
 # Auto-detect JAVA_HOME and ANDROID_HOME if not already configured in environment
 if (-not $env:JAVA_HOME) {
@@ -124,10 +141,10 @@ if (Test-Path (Join-Path $AndroidDir "gradlew.bat")) {
 }
 
 # =============================================================================
-# [3/3] Done
+# [4/4] Done
 # =============================================================================
 Set-Location $RootDir
 
-Write-Host "`n🎉 [3/3] Packaging Complete!" -ForegroundColor Cyan
+Write-Host "`n🎉 [4/4] Packaging Complete!" -ForegroundColor Cyan
 Write-Host "Releases Directory Contents:"
 Get-ChildItem -Path $ReleasesDir -Recurse | Select-Object FullName, Length

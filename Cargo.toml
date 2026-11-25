@@ -1,0 +1,14 @@
+[workspace]
+resolver = "2"
+members = ["core", "cli", "desktop/src-tauri"]
+# `cargo build` / `cargo test` at the root skip the desktop app, so Linux
+# machines without WebKit can build the CLI. Build the desktop app with
+# `npm run tauri build` in desktop/.
+default-members = ["core", "cli"]
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = 3
+panic = "abort"
+strip = true

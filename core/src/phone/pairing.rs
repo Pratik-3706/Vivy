@@ -131,7 +131,7 @@ pub fn new_nonce() -> String {
 impl Pairing {
     /// Loads (or creates) the TLS identity and the paired phone, if any.
     pub fn load() -> Result<Self, String> {
-        Self::load_in(std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("Vivy")))
+        Self::load_in(crate::paths::data_dir())
     }
 
     /// Same as [`Pairing::load`], storing everything under `dir`.
@@ -267,7 +267,7 @@ impl Pairing {
 }
 
 /// The PC's certificate and private key (DER), made once and kept in
-/// %LOCALAPPDATA%\Vivy\tls so the phone's pinned fingerprint stays valid.
+/// the data folder's `tls` folder so the phone's pinned fingerprint stays valid.
 fn load_or_create_identity(dir: Option<&std::path::Path>) -> Result<(Vec<u8>, Vec<u8>), String> {
     let paths = dir.map(|d| (d.join("tls").join("cert.der"), d.join("tls").join("key.der")));
     if let Some((cert_path, key_path)) = &paths {

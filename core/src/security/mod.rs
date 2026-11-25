@@ -186,7 +186,8 @@ const FIELDS: &[Field] = &[
     ("reasoning_effort", |c| &c.reasoning_effort, |c, v| c.reasoning_effort = v),
 ];
 
-/// Saves credentials securely in Windows Credential Manager / OS Keychain with fallback
+/// Saves settings in the OS keyring (Windows Credential Manager, Secret Service on
+/// Linux), or in a private file if the keyring is unavailable.
 pub fn save_credentials_securely(creds: &ApiCredentials) -> Result<(), String> {
     let written = FIELDS
         .iter()
@@ -210,8 +211,17 @@ pub fn save_credentials_securely(creds: &ApiCredentials) -> Result<(), String> {
     }
 }
 
-/// Retrieves credentials securely from Windows Credential Manager / OS Keychain
+/// Settings for running the agent: the saved ones, with environment
+/// overrides applied (see [`apply_env_overrides`]).
 pub fn load_credentials_securely() -> ApiCredentials {
+    let mut creds = load_saved_credentials();
+    apply_env_overrides(&mut creds, |k| std::env::var(k).ok());
+    creds
+}
+
+/// Settings exactly as saved, for editing and saving back, so a temporary
+/// environment override is never written into the keyring.
+pub fn load_saved_credentials() -> ApiCredentials {
     let fallback = load_fallback_creds();
     let mut creds = ApiCredentials::default();
     let mut has_provider = false;
@@ -241,6 +251,41 @@ pub fn load_credentials_securely() -> ApiCredentials {
     creds
 }
 
+/// Environment variables win over saved settings, for scripts, CI and
+/// headless machines without a keyring:
+/// `VIVY_PROVIDER`, `VIVY_MODEL`, `VIVY_API_KEY` (for that provider),
+/// `VIVY_BASE_URL` (custom provider), `VIVY_EFFORT`, `TAVILY_API_KEY`.
+fn apply_env_overrides(creds: &mut ApiCredentials, var: impl Fn(&str) -> Option<String>) {
+    let var = |k: &str| var(k).map(|v| v.trim().to_string()).filter(|v| !v.is_empty());
+    if let Some(p) = var("VIVY_PROVIDER") {
+        creds.provider = p.to_ascii_lowercase();
+    }
+    if let Some(url) = var("VIVY_BASE_URL") {
+        creds.base_url = url;
+        if var("VIVY_PROVIDER").is_none() {
+            creds.provider = "custom".to_string();
+        }
+    }
+    if let Some(m) = var("VIVY_MODEL") {
+        creds.model_name = m;
+    }
+    if let Some(e) = var("VIVY_EFFORT") {
+        creds.reasoning_effort = e;
+    }
+    if let Some(k) = var("VIVY_API_KEY") {
+        match creds.provider.as_str() {
+            "openai" => creds.openai_key = k,
+            "anthropic" => creds.anthropic_key = k,
+            "google" => creds.google_key = k,
+            "custom" => creds.custom_key = k,
+            _ => creds.aicredits_key = k,
+        }
+    }
+    if let Some(k) = var("TAVILY_API_KEY") {
+        creds.tavily_key = k;
+    }
+}
+
 fn save_keyring_entry(account: &str, secret: &str) -> Result<(), String> {
     std::panic::catch_unwind(|| {
         let entry = keyring::Entry::new(SERVICE_NAME, account)
@@ -261,21 +306,28 @@ fn read_keyring_entry(account: &str) -> Option<String> {
     .flatten()
 }
 
+/// Used only when the system keyring is unavailable (e.g. a Linux machine
+/// without a Secret Service). Readable by the current user only.
 fn get_fallback_path() -> Option<PathBuf> {
-    let app_dir = std::env::var("LOCALAPPDATA").ok()?;
-    let path = PathBuf::from(app_dir).join("Vivy").join("config.json");
-    if let Some(parent) = path.parent() {
-        let _ = fs::create_dir_all(parent);
-    }
-    Some(path)
+    crate::paths::data_path("config.json")
 }
 
 fn save_fallback_creds(creds: &ApiCredentials) -> Result<(), String> {
     if let Some(path) = get_fallback_path() {
         let json = serde_json::to_string(creds).map_err(|e| e.to_string())?;
-        fs::write(path, json).map_err(|e| e.to_string())?;
+        crate::paths::write_private(&path, json.as_bytes()).map_err(|e| e.to_string())?;
     }
     Ok(())
+}
+
+/// Where settings and keys currently live, for display.
+pub fn credential_store_label() -> String {
+    match get_fallback_path().filter(|p| p.exists()) {
+        Some(p) => format!("{} (system keyring unavailable)", p.display()),
+        None if cfg!(windows) => "Windows Credential Manager".to_string(),
+        None if cfg!(target_os = "macos") => "macOS Keychain".to_string(),
+        None => "system keyring (Secret Service)".to_string(),
+    }
 }
 
 fn load_fallback_creds() -> Option<ApiCredentials> {
@@ -290,6 +342,24 @@ mod tests {
 
     fn creds(provider: &str, effort: &str) -> ApiCredentials {
         ApiCredentials { provider: provider.into(), reasoning_effort: effort.into(), ..Default::default() }
+    }
+
+    #[test]
+    fn environment_overrides_saved_settings() {
+        let env = |pairs: &'static [(&'static str, &'static str)]| {
+            move |k: &str| pairs.iter().find(|(n, _)| *n == k).map(|(_, v)| v.to_string())
+        };
+        let mut c = ApiCredentials::default();
+        apply_env_overrides(&mut c, env(&[("VIVY_BASE_URL", "http://localhost:9/v1"), ("VIVY_API_KEY", "k1")]));
+        assert_eq!((c.provider.as_str(), c.custom_key.as_str(), c.api_base().as_str()), ("custom", "k1", "http://localhost:9/v1"));
+
+        let mut c = ApiCredentials::default();
+        apply_env_overrides(&mut c, env(&[("VIVY_PROVIDER", "Google"), ("VIVY_API_KEY", "g"), ("VIVY_MODEL", "m")]));
+        assert_eq!((c.provider.as_str(), c.api_key(), c.model_name.as_str()), ("google", "g", "m"));
+
+        let mut c = ApiCredentials::default();
+        apply_env_overrides(&mut c, env(&[("VIVY_MODEL", "  ")]));
+        assert_eq!(c.model_name, DEFAULT_MODEL);
     }
 
     #[test]

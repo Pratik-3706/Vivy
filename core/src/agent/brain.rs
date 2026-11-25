@@ -3,10 +3,10 @@ use std::time::{Duration, Instant};
 use futures_util::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
-use tauri::{AppHandle, Emitter};
 use tokio::sync::watch;
 use uuid::Uuid;
 
+use crate::events::Events;
 use crate::agent::permissions::{PermissionCategory, PermissionManager};
 use crate::agent::search::execute_tavily_search;
 use crate::agent::tools::get_agent_tools_schema;
@@ -62,7 +62,7 @@ enum ToolOutcome {
 }
 
 pub struct AgentSession {
-    app: AppHandle,
+    events: Events,
     phone: PhoneManager,
     permissions: PermissionManager,
     creds: ApiCredentials,
@@ -82,7 +82,7 @@ pub struct AgentSession {
 }
 
 /// Show an activity entry in the UI and save it in the active chat. Returns its id.
-pub fn record_log(app: &AppHandle, store: &SessionStore, action_type: &str, description: &str, details: Option<Value>) -> String {
+pub fn record_log(events: &Events, store: &SessionStore, action_type: &str, description: &str, details: Option<Value>) -> String {
     let log = AgentActionLog {
         id: Uuid::new_v4().to_string(),
         timestamp: chrono::Utc::now().timestamp_millis() as u64,
@@ -93,13 +93,13 @@ pub fn record_log(app: &AppHandle, store: &SessionStore, action_type: &str, desc
     if let Ok(v) = serde_json::to_value(&log) {
         store.append_log(v);
     }
-    let _ = app.emit("agent-action", &log);
+    events.emit("agent-action", &log);
     log.id
 }
 
 impl AgentSession {
     pub fn new(
-        app: AppHandle,
+        events: Events,
         phone: PhoneManager,
         permissions: PermissionManager,
         creds: ApiCredentials,
@@ -114,7 +114,7 @@ impl AgentSession {
             .build()
             .unwrap_or_default();
         Self {
-            app,
+            events,
             phone,
             permissions,
             creds,
@@ -134,11 +134,11 @@ impl AgentSession {
     }
 
     fn emit_log(&self, action_type: &str, description: &str, details: Option<Value>) {
-        record_log(&self.app, &self.store, action_type, description, details);
+        record_log(&self.events, &self.store, action_type, description, details);
     }
 
     fn emit_stream(&self, step: usize, kind: &str, text: &str) {
-        let _ = self.app.emit("agent-stream", json!({ "step": step, "kind": kind, "text": text }));
+        self.events.emit("agent-stream", &json!({ "step": step, "kind": kind, "text": text }));
     }
 
     /// Blocks while the user has the task paused. Returns true if it waited.
@@ -164,7 +164,7 @@ impl AgentSession {
         history: Vec<Value>,
     ) -> Result<String, String> {
         if self.creds.api_key().is_empty() {
-            return Err("No API key set. Add one in Settings.".to_string());
+            return Err("No API key set. Add one in Settings (desktop) or with `vivy key` (terminal).".to_string());
         }
 
         let device_line = if self.phone.is_connected().await {
@@ -193,8 +193,8 @@ impl AgentSession {
         };
 
         let system_prompt = format!(
-            "You are Vivy, an AI assistant living in the Vivy desktop app on the user's PC. You can see and \
-             operate the user's Android phone. Your name is a nod to the anime songstress AI Vivy.\n\
+            "You are Vivy, an AI assistant living in the Vivy app on the user's computer (a desktop window or a \
+             terminal). You can see and operate the user's Android phone. Your name is a nod to the anime songstress AI Vivy.\n\
              You do the thinking and deciding. Your hands are Matsumoto: a small, white, cube-shaped helper \
              program (named after the cube AI from the same anime) who runs your tools on the phone and reports \
              back. In the app, your messages appear under \"Vivy\" and every tool call appears under \
@@ -1164,7 +1164,7 @@ fn split_think_tags(text: &str) -> (String, String) {
 }
 
 /// Timing log for model replies, kept so streaming problems can be diagnosed:
-/// %LOCALAPPDATA%\\Vivy\\stream-debug.log. Records when each chunk arrived and a
+/// stream-debug.log in the data folder. Records when each chunk arrived and a
 /// short preview of it. Never includes the API key or request headers.
 struct StreamTrace {
     started: Instant,
@@ -1204,10 +1204,7 @@ impl StreamTrace {
 
 impl Drop for StreamTrace {
     fn drop(&mut self) {
-        let Ok(dir) = std::env::var("LOCALAPPDATA") else { return };
-        let dir = std::path::PathBuf::from(dir).join("Vivy");
-        let _ = std::fs::create_dir_all(&dir);
-        let path = dir.join("stream-debug.log");
+        let Some(path) = crate::paths::data_path("stream-debug.log") else { return };
         // Start over once the file gets big; only recent requests matter.
         let append = std::fs::metadata(&path).map(|m| m.len() < Self::MAX_FILE).unwrap_or(false);
         let file = std::fs::OpenOptions::new()

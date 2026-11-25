@@ -329,6 +329,7 @@ const PairingPanel: React.FC<{
 }> = ({ connectionUrl, copied, onCopy, phoneError }) => {
   const { pairing, secondsLeft, newCode, cancel, forget } = usePairing();
   const [confirmForget, setConfirmForget] = useState(false);
+  const firewall = useFirewall();
   const paired = pairing?.paired ?? null;
   const code = pairing?.code ?? null;
 
@@ -403,7 +404,45 @@ const PairingPanel: React.FC<{
         Same Wi-Fi network required. Over USB, run <code>adb reverse tcp:8765 tcp:8765</code> and use{' '}
         <code>127.0.0.1</code>.
       </p>
+      {firewall.blocked && (
+        <div className="banner firewall-banner">
+          <span>
+            Windows Firewall is blocking Vivy, so your phone can&rsquo;t connect.
+            {firewall.error && <span className="firewall-error"> {firewall.error}</span>}
+          </span>
+          <button className="btn btn-primary" onClick={firewall.fix} disabled={firewall.fixing}>
+            {firewall.fixing ? 'Waiting for Windows…' : 'Allow in firewall'}
+          </button>
+        </div>
+      )}
       {phoneError && <div className="banner">{phoneError}</div>}
     </div>
   );
 };
+
+/** Windows Firewall status for the phone port, with a fix that asks Windows for admin rights. */
+function useFirewall() {
+  const [status, setStatus] = useState<string>('unknown');
+  const [fixing, setFixing] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    tauriApi.checkFirewall().then(setStatus).catch(() => setStatus('unknown'));
+    const unlisten = tauriApi.onPhoneFirewall(setStatus);
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+  }, []);
+
+  const fix = () => {
+    setFixing(true);
+    setError(null);
+    tauriApi
+      .allowFirewall()
+      .then(setStatus)
+      .catch((err) => setError(String(err)))
+      .finally(() => setFixing(false));
+  };
+
+  return { blocked: status === 'blocked' || status === 'missing', fixing, error, fix };
+}
