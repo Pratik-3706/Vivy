@@ -1,24 +1,17 @@
-pub mod agent;
-pub mod phone;
-pub mod security;
-pub mod sessions;
-pub mod state;
+//! The desktop app: Tauri commands over the shared engine in `vivy-core`.
 
-use std::sync::atomic::Ordering;
 use serde::{Deserialize, Serialize};
-use serde_json::json;
-use tauri::{AppHandle, Emitter, Manager, State};
+use serde_json::{json, Value};
+use tauri::{Emitter, Manager, State};
 use tauri_plugin_global_shortcut::{Code, GlobalShortcutExt, Modifiers, Shortcut, ShortcutState};
 use uuid::Uuid;
 
-use crate::agent::brain::{record_log, AgentSession};
-use crate::agent::memory::{compact, Compaction};
-use crate::sessions::{Session, SessionMeta};
-use crate::agent::permissions::PermissionManager;
-use crate::phone::commands::{DeviceState, PhoneCommand};
-use crate::phone::connection::{start_websocket_server, PhoneManager};
-use crate::security::{load_credentials_securely, save_credentials_securely};
-use crate::state::{get_local_lan_ip, AppState};
+use vivy_core::events::Events;
+use vivy_core::phone::commands::{DeviceState, PhoneCommand};
+use vivy_core::security::{load_credentials_securely, load_saved_credentials, save_credentials_securely};
+use vivy_core::sessions::{Session, SessionMeta};
+use vivy_core::state::{get_local_lan_ip, AppState};
+use vivy_core::PHONE_PORT;
 
 #[derive(Serialize, Deserialize)]
 pub struct SettingsView {
@@ -73,14 +66,14 @@ fn get_settings() -> SettingsView {
         base_url: creds.base_url,
         vision_model: creds.vision_model,
         reasoning_effort: creds.reasoning_effort,
-        ws_port: 8765,
+        ws_port: PHONE_PORT,
         local_ip,
     }
 }
 
 #[tauri::command]
 fn save_settings(payload: SaveSettingsPayload) -> Result<(), String> {
-    let mut c = load_credentials_securely();
+    let mut c = load_saved_credentials();
     let SaveSettingsPayload {
         provider,
         aicredits_key,
@@ -127,7 +120,7 @@ async fn get_latest_frame(state: State<'_, AppState>) -> Result<Option<String>, 
 
 // ---- Phone pairing ------------------------------------------------------------
 
-fn pairing_of(state: &AppState) -> Result<std::sync::Arc<crate::phone::pairing::Pairing>, String> {
+fn pairing_of(state: &AppState) -> Result<std::sync::Arc<vivy_core::phone::pairing::Pairing>, String> {
     state
         .phone
         .pairing
@@ -137,27 +130,43 @@ fn pairing_of(state: &AppState) -> Result<std::sync::Arc<crate::phone::pairing::
 
 /// The paired phone (if any) and the current pairing code.
 #[tauri::command]
-fn get_pairing(state: State<'_, AppState>) -> Result<crate::phone::pairing::PairingView, String> {
+fn get_pairing(state: State<'_, AppState>) -> Result<vivy_core::phone::pairing::PairingView, String> {
     Ok(pairing_of(&state)?.view())
 }
 
 /// Show a fresh code, e.g. to pair a different phone.
 #[tauri::command]
-fn start_pairing(state: State<'_, AppState>) -> Result<crate::phone::pairing::PairingView, String> {
+fn start_pairing(state: State<'_, AppState>) -> Result<vivy_core::phone::pairing::PairingView, String> {
     Ok(pairing_of(&state)?.start())
 }
 
 #[tauri::command]
-fn cancel_pairing(state: State<'_, AppState>) -> Result<crate::phone::pairing::PairingView, String> {
+fn cancel_pairing(state: State<'_, AppState>) -> Result<vivy_core::phone::pairing::PairingView, String> {
     Ok(pairing_of(&state)?.cancel())
 }
 
 /// Unpair the phone and close its connection.
 #[tauri::command]
-async fn forget_phone(state: State<'_, AppState>) -> Result<crate::phone::pairing::PairingView, String> {
+async fn forget_phone(state: State<'_, AppState>) -> Result<vivy_core::phone::pairing::PairingView, String> {
     let view = pairing_of(&state)?.forget();
     state.phone.disconnect().await;
     Ok(view)
+}
+
+/// Whether Windows Firewall lets the phone reach this app.
+#[tauri::command]
+async fn check_firewall() -> Result<vivy_core::firewall::FirewallStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| vivy_core::firewall::check(PHONE_PORT))
+        .await
+        .map_err(|e| e.to_string())
+}
+
+/// Allow this app through Windows Firewall (shows the Windows admin prompt).
+#[tauri::command]
+async fn allow_firewall() -> Result<vivy_core::firewall::FirewallStatus, String> {
+    tauri::async_runtime::spawn_blocking(|| vivy_core::firewall::allow(PHONE_PORT))
+        .await
+        .map_err(|e| e.to_string())?
 }
 
 #[tauri::command]
@@ -165,8 +174,8 @@ fn get_connection_info() -> serde_json::Value {
     let ip = get_local_lan_ip();
     json!({
         "ip": ip,
-        "port": 8765,
-        "ws_url": format!("wss://{}:8765", ip)
+        "port": PHONE_PORT,
+        "ws_url": format!("wss://{ip}:{PHONE_PORT}")
     })
 }
 
@@ -174,103 +183,9 @@ fn get_connection_info() -> serde_json::Value {
 async fn start_agent_task(
     prompt: String,
     rewind_from: Option<String>,
-    app: AppHandle,
     state: State<'_, AppState>,
 ) -> Result<(), String> {
-    if !state.is_agent_enabled() {
-        return Err("The agent is switched off. Turn it on to run tasks.".to_string());
-    }
-    let guard = state
-        .running_task_lock
-        .clone()
-        .try_lock_owned()
-        .map_err(|_| "A task is already running. Stop it first.".to_string())?;
-
-    let phone = state.phone.clone();
-    let permissions = state.permissions.clone();
-    let creds = load_credentials_securely();
-    // Subscribe before spawning so a stop pressed right away is not missed.
-    let mut cancel_rx = state.cancel_tx.subscribe();
-    state.pause_tx.send_replace(false);
-    let pause_rx = state.pause_tx.subscribe();
-    let store = state.sessions.clone();
-    // Resending an earlier message replaces it and everything after it.
-    if let Some(id) = rewind_from.as_deref() {
-        store.rewind(id)?;
-    }
-    let task_id = record_log(&app, &store, "task", &prompt, None);
-
-    tauri::async_runtime::spawn(async move {
-        let _guard = guard;
-
-        // Fold old turns into a summary first if this chat's memory has grown large.
-        let (mut summary, mut history) = store.context();
-        let session_id = store.active().id;
-        let compaction = tokio::select! {
-            c = compact(&creds, summary.as_deref(), &history) => c,
-            _ = cancel_rx.changed() => {
-                let _ = app.emit("agent-stopped", ());
-                record_log(&app, &store, "stopped", "Stopped", None);
-                return;
-            }
-        };
-        match compaction {
-            Compaction::None => {}
-            Compaction::Summarized { summary: s, folded } => {
-                store.apply_compaction(&session_id, s.clone(), folded);
-                history.drain(..folded);
-                summary = Some(s);
-                record_log(&app, &store, "compacted",
-                    &format!("Condensed {} older messages into a summary to keep Vivy's memory short.", folded), None);
-            }
-            Compaction::Dropped { folded } => {
-                store.apply_compaction(&session_id, summary.clone().unwrap_or_default(), folded);
-                history.drain(..folded);
-                record_log(&app, &store, "compacted",
-                    &format!("Dropped {} of the oldest messages from Vivy's memory.", folded), None);
-            }
-        }
-
-        let session = AgentSession::new(app.clone(), phone, permissions.clone(), creds, pause_rx, store.clone());
-
-        let outcome = tokio::select! {
-            result = session.run_task(prompt.clone(), summary, history) => match result {
-                Ok(summary) => {
-                    let _ = app.emit("agent-complete", json!({ "summary": summary }));
-                    summary
-                }
-                Err(err) => {
-                    let _ = app.emit("agent-error", json!({ "error": err }));
-                    format!("(This attempt failed: {err})")
-                }
-            },
-            // Dropping run_task's future aborts whatever it was awaiting:
-            // the model request, a phone command, a wait, or a permission prompt.
-            _ = cancel_rx.changed() => {
-                permissions.cancel_pending().await;
-                record_log(&app, &store, "stopped", "Stopped", None);
-                let _ = app.emit("agent-stopped", ());
-                "(The user stopped this before it finished.)".to_string()
-            }
-        };
-
-        remember_turn(&store, &task_id, prompt, outcome, session.actions());
-        let _ = app.emit("sessions-changed", ());
-    });
-
-    Ok(())
-}
-
-/// Store one finished turn in the chat's memory: the user's message and Vivy's
-/// reply, with a short list of what was done on the phone so follow-ups like
-/// "now search it" work. Large memories are compacted before the next task.
-fn remember_turn(store: &crate::sessions::SessionStore, task_id: &str, prompt: String, reply: String, actions: Vec<String>) {
-    let mut reply = reply;
-    if !actions.is_empty() {
-        let shown: Vec<_> = actions.iter().rev().take(25).rev().cloned().collect();
-        reply.push_str(&format!("\n\n[Phone actions taken: {}]", shown.join("; ")));
-    }
-    store.push_turn(task_id, prompt, reply);
+    vivy_core::runner::start_task(&state, prompt, rewind_from).map(|_| ())
 }
 
 // ---- Chat sessions -----------------------------------------------------------
@@ -325,11 +240,8 @@ fn stop_agent_task(state: State<'_, AppState>) {
 
 /// Pause between actions so the user can use the phone by hand, then resume.
 #[tauri::command]
-fn set_agent_paused(paused: bool, app: AppHandle, state: State<'_, AppState>) -> bool {
-    let paused = paused && state.is_task_running();
-    state.pause_tx.send_replace(paused);
-    let _ = app.emit("agent-paused", paused);
-    paused
+fn set_agent_paused(paused: bool, state: State<'_, AppState>) -> bool {
+    state.set_paused(paused)
 }
 
 #[derive(Serialize)]
@@ -344,22 +256,15 @@ fn get_agent_status(state: State<'_, AppState>) -> AgentStatus {
     AgentStatus {
         enabled: state.is_agent_enabled(),
         running: state.is_task_running(),
-        paused: *state.pause_tx.borrow(),
+        paused: state.is_paused(),
     }
 }
 
 /// The master switch. Turning it off kills the running task on the spot,
 /// denies any open permission prompt and forgets granted permissions.
 #[tauri::command]
-async fn set_agent_enabled(enabled: bool, app: AppHandle, state: State<'_, AppState>) -> Result<bool, String> {
-    state.agent_enabled.store(enabled, Ordering::SeqCst);
-    if !enabled {
-        state.cancel_active_task();
-        state.permissions.cancel_pending().await;
-        state.permissions.revoke_all().await;
-    }
-    let _ = app.emit("agent-enabled-changed", enabled);
-    Ok(enabled)
+async fn set_agent_enabled(enabled: bool, state: State<'_, AppState>) -> Result<bool, String> {
+    Ok(state.set_enabled(enabled).await)
 }
 
 #[tauri::command]
@@ -466,13 +371,18 @@ pub fn run() {
                 eprintln!("[Vivy] Couldn't register the stop hotkey (Ctrl+Shift+X): {e}");
             }
             let handle = app.handle().clone();
-            let phone = PhoneManager::new(handle.clone());
-            let permissions = PermissionManager::new(handle.clone());
+            // Engine events go straight to the web UI.
+            let events = Events::new(move |name: &str, payload: Value| {
+                let _ = handle.emit(name, payload);
+            });
+            let state = AppState::new(events);
 
-            // Start WebSocket server on 8765
-            start_websocket_server(phone.clone(), 8765);
+            // The phone server needs the async runtime, which setup doesn't run on.
+            let phone = state.phone.clone();
+            tauri::async_runtime::spawn(async move {
+                vivy_core::phone::connection::start_websocket_server(phone, PHONE_PORT);
+            });
 
-            let state = AppState::new(phone, permissions);
             app.manage(state);
 
             Ok(())
@@ -487,6 +397,8 @@ pub fn run() {
             start_pairing,
             cancel_pairing,
             forget_phone,
+            check_firewall,
+            allow_firewall,
             start_agent_task,
             stop_agent_task,
             list_sessions,

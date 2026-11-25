@@ -1,7 +1,8 @@
 /**
  * Model providers Vivy can use. All of them speak the OpenAI chat-completions
  * API, so only the endpoint, key and model names differ. The endpoints live in
- * the Rust side (security/mod.rs); this list drives the UI.
+ * the Rust side (core/src/security). Keep this list in sync with
+ * core/src/providers.rs, which the terminal app uses.
  *
  * Mostly mid-tier models (capable enough for multi-step phone tasks, without
  * flagship prices) plus each provider's top model for complex tasks.

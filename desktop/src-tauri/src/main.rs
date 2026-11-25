@@ -10,11 +10,8 @@ fn main() {
     panic::set_hook(Box::new(|info| {
         let msg = format!("[Vivy Panic] {}\n", info);
         eprintln!("{}", msg);
-        if let Ok(mut file) = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open("vivy_crash.log")
-        {
+        let Some(path) = vivy_core::paths::data_path("vivy_crash.log") else { return };
+        if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(path) {
             let _ = writeln!(file, "{}", msg);
         }
     }));

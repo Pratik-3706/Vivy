@@ -5,7 +5,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::json;
-use tauri::{AppHandle, Emitter};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::{mpsc, oneshot, Mutex, Notify, RwLock};
 use tokio_tungstenite::tungstenite::Message;
@@ -13,6 +12,8 @@ use uuid::Uuid;
 
 use super::commands::{DeviceState, PhoneCommand, PhoneMessage};
 use super::pairing::{self, Pairing};
+use crate::events::Events;
+use crate::vlog;
 
 type WsSink<S> = futures_util::stream::SplitSink<tokio_tungstenite::WebSocketStream<S>, Message>;
 type WsSource<S> = futures_util::stream::SplitStream<tokio_tungstenite::WebSocketStream<S>>;
@@ -28,7 +29,7 @@ type PendingResponses = Arc<Mutex<HashMap<String, oneshot::Sender<CommandReply>>
 
 #[derive(Clone)]
 pub struct PhoneManager {
-    app: AppHandle,
+    events: Events,
     /// Sender for the active connection, tagged with that connection's id so a
     /// stale connection closing never tears down a newer one. The Notify closes it.
     tx: Arc<Mutex<Option<(u64, mpsc::Sender<PhoneCommand>, Arc<Notify>)>>>,
@@ -42,17 +43,17 @@ pub struct PhoneManager {
 }
 
 impl PhoneManager {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(events: Events) -> Self {
         let pairing = match Pairing::load() {
             Ok(p) => Some(Arc::new(p)),
             Err(e) => {
-                eprintln!("[Vivy] Secure pairing unavailable: {e}");
+                vlog!("[Vivy] Secure pairing unavailable: {e}");
                 None
             }
         };
         Self {
             pairing,
-            app,
+            events,
             tx: Arc::new(Mutex::new(None)),
             next_conn_id: Arc::new(AtomicU64::new(1)),
             pending: Arc::new(Mutex::new(HashMap::new())),
@@ -124,52 +125,65 @@ impl PhoneManager {
             state.last_seen = chrono::Utc::now().timestamp_millis() as u64;
             if !state.streaming {
                 state.streaming = true;
-                let _ = self.app.emit("phone-status", state.clone());
+                self.events.emit("phone-status", &*state);
             }
         }
         // Live frame for the UI (memory only, never written to disk)
-        let _ = self.app.emit("phone-frame", json!({ "frame": b64 }));
+        self.events.emit("phone-frame", &json!({ "frame": b64 }));
     }
 }
 
 /// Starts the background WebSocket server
 pub fn start_websocket_server(manager: PhoneManager, port: u16) {
-    tauri::async_runtime::spawn(async move {
+    tokio::spawn(async move {
         let addr = SocketAddr::from(([0, 0, 0, 0], port));
         if manager.pairing.is_none() {
-            let _ = manager.app.emit(
-                "phone-error",
-                json!({ "error": "Secure connection setup failed, so phones can't connect. Restart Vivy to try again." }),
+            manager.events.emit("phone-error", &json!({ "error": "Secure connection setup failed, so phones can't connect. Restart Vivy to try again." }),
             );
             return;
         }
         let listener = match TcpListener::bind(addr).await {
             Ok(l) => {
-                println!("[Vivy WebSocket] Server listening on wss://0.0.0.0:{port}");
+                vlog!("[Vivy WebSocket] Server listening on wss://0.0.0.0:{port}");
                 l
             }
             Err(e) => {
-                eprintln!("[Vivy WebSocket] Failed to bind port {port}: {e}");
-                let _ = manager.app.emit(
-                    "phone-error",
-                    json!({ "error": format!("Couldn't open port {port}: {e}. Is another copy of Vivy running?") }),
-                );
+                vlog!("[Vivy WebSocket] Failed to bind port {port}: {e}");
+                let error = if e.kind() == std::io::ErrorKind::AddrInUse {
+                    format!(
+                        "Port {port} is already in use, most likely by Vivy's other app (the desktop app or the CLI).                          Only one of them can talk to the phone at a time: close the other one and start this again."
+                    )
+                } else {
+                    format!("Couldn't open port {port}: {e}.")
+                };
+                manager.events.emit("phone-error", &json!({ "error": error }));
                 return;
             }
         };
 
+        // Windows drops connections for programs the firewall hasn't allowed,
+        // and the phone only sees a timeout. Check, and tell the front end.
+        let events = manager.events.clone();
+        tokio::task::spawn_blocking(move || {
+            let status = crate::firewall::check(port);
+            vlog!("[Vivy WebSocket] Firewall check: {status:?}");
+            if status.needs_fix() {
+                events.emit("phone-firewall", &json!({ "status": status, "message": status.message() }));
+            }
+        });
+
         loop {
             match listener.accept().await {
                 Ok((stream, peer_addr)) => {
-                    println!("[Vivy WebSocket] Incoming connection from {peer_addr}");
+                    vlog!("[Vivy WebSocket] Incoming connection from {peer_addr}");
                     let _ = stream.set_nodelay(true);
                     let mgr_clone = manager.clone();
-                    tauri::async_runtime::spawn(async move {
+                    tokio::spawn(async move {
                         handle_connection(stream, mgr_clone, peer_addr).await;
                     });
                 }
                 Err(e) => {
-                    eprintln!("[Vivy WebSocket] Accept error: {e}");
+                    vlog!("[Vivy WebSocket] Accept error: {e}");
                 }
             }
         }
@@ -183,26 +197,26 @@ async fn handle_connection(stream: TcpStream, manager: PhoneManager, peer_addr: 
     let tls = match tokio::time::timeout(AUTH_TIMEOUT, pairing.acceptor.accept(stream)).await {
         Ok(Ok(tls)) => tls,
         _ => {
-            eprintln!("[Vivy WebSocket] TLS handshake failed with {peer_addr}");
+            vlog!("[Vivy WebSocket] TLS handshake failed with {peer_addr}");
             return;
         }
     };
     let ws = match tokio::time::timeout(AUTH_TIMEOUT, tokio_tungstenite::accept_async(tls)).await {
         Ok(Ok(ws)) => ws,
         _ => {
-            eprintln!("[Vivy WebSocket] WebSocket handshake failed with {peer_addr}");
+            vlog!("[Vivy WebSocket] WebSocket handshake failed with {peer_addr}");
             return;
         }
     };
     let (mut ws_sink, mut ws_stream) = ws.split();
 
     // Nothing is shared with a connection until it proves it's the paired phone.
-    let app = manager.app.clone();
+    let events = manager.events.clone();
     let on_change = move |view: pairing::PairingView| {
-        let _ = app.emit("pairing-changed", view);
+        events.emit("pairing-changed", &view);
     };
     if let Err(reason) = authenticate(&mut ws_sink, &mut ws_stream, &pairing, &on_change).await {
-        eprintln!("[Vivy WebSocket] Rejected {peer_addr}: {reason}");
+        vlog!("[Vivy WebSocket] Rejected {peer_addr}: {reason}");
         let _ = ws_sink.send(Message::Close(None)).await;
         return;
     }
@@ -222,20 +236,20 @@ async fn handle_connection(stream: TcpStream, manager: PhoneManager, peer_addr: 
         state.accessibility = None;
         state.screen_share = None;
         state.last_seen = chrono::Utc::now().timestamp_millis() as u64;
-        let _ = manager.app.emit("phone-connected", state.clone());
+        manager.events.emit("phone-connected", &*state);
     }
 
-    let write_task = tauri::async_runtime::spawn(async move {
+    let write_task = tokio::spawn(async move {
         while let Some(cmd) = cmd_rx.recv().await {
             let json_str = match serde_json::to_string(&cmd) {
                 Ok(s) => s,
                 Err(e) => {
-                    eprintln!("[Vivy WebSocket] Command serialize error: {e}");
+                    vlog!("[Vivy WebSocket] Command serialize error: {e}");
                     continue;
                 }
             };
             if let Err(e) = ws_sink.send(Message::Text(json_str.into())).await {
-                eprintln!("[Vivy WebSocket] Send command error: {e}");
+                vlog!("[Vivy WebSocket] Send command error: {e}");
                 break;
             }
         }
@@ -248,7 +262,7 @@ async fn handle_connection(stream: TcpStream, manager: PhoneManager, peer_addr: 
                 None => break,
             },
             _ = kick.notified() => {
-                println!("[Vivy WebSocket] Closing connection from {peer_addr}");
+                vlog!("[Vivy WebSocket] Closing connection from {peer_addr}");
                 break;
             }
         };
@@ -262,11 +276,11 @@ async fn handle_connection(stream: TcpStream, manager: PhoneManager, peer_addr: 
                 manager.store_frame(b64).await;
             }
             Ok(Message::Close(_)) => {
-                println!("[Vivy WebSocket] Client requested close: {peer_addr}");
+                vlog!("[Vivy WebSocket] Client requested close: {peer_addr}");
                 break;
             }
             Err(e) => {
-                eprintln!("[Vivy WebSocket] Stream error from {peer_addr}: {e}");
+                vlog!("[Vivy WebSocket] Stream error from {peer_addr}: {e}");
                 break;
             }
             _ => {}
@@ -298,9 +312,9 @@ async fn handle_connection(stream: TcpStream, manager: PhoneManager, peer_addr: 
             state.connected = false;
             state.streaming = false;
         }
-        let _ = manager.app.emit("phone-disconnected", ());
+        manager.events.emit("phone-disconnected", &());
     }
-    println!("[Vivy WebSocket] Phone disconnected: {peer_addr}");
+    vlog!("[Vivy WebSocket] Phone disconnected: {peer_addr}");
 }
 
 /// Next text message as JSON, within `limit`.
@@ -318,7 +332,19 @@ where
         match msg {
             Message::Text(t) => return serde_json::from_str(&t).map_err(|_| "not JSON".to_string()),
             Message::Ping(_) | Message::Pong(_) => continue,
-            _ => return Err("unexpected message".into()),
+            // A screen frame that was already on its way when the phone
+            // (re)connected. Harmless; keep waiting for the login.
+            Message::Binary(b) => {
+                vlog!("[Vivy WebSocket] Skipped a {}-byte frame sent before the phone logged in", b.len());
+                continue;
+            }
+            Message::Close(frame) => {
+                return Err(match frame {
+                    Some(f) => format!("phone closed the connection first ({}: {})", u16::from(f.code), f.reason),
+                    None => "phone closed the connection first".to_string(),
+                })
+            }
+            other => return Err(format!("unexpected message: {other:?}")),
         }
     }
 }
@@ -411,7 +437,7 @@ async fn process_incoming_message(text: &str, manager: &PhoneManager) {
         Ok(m) => m,
         Err(e) => {
             let sample: String = text.chars().take(80).collect();
-            eprintln!("[Vivy WebSocket] Parse error: {e}. Prefix: {sample}");
+            vlog!("[Vivy WebSocket] Parse error: {e}. Prefix: {sample}");
             return;
         }
     };
@@ -443,13 +469,13 @@ async fn process_incoming_message(text: &str, manager: &PhoneManager) {
                 state.battery_level = battery_level;
                 state.is_charging = is_charging;
                 state.last_seen = chrono::Utc::now().timestamp_millis() as u64;
-                let _ = manager.app.emit("phone-status", state.clone());
+                manager.events.emit("phone-status", &*state);
             }
 
             // Ask for the stream from a separate task so the reader loop keeps
             // draining messages (the reply arrives through this same loop).
             let mgr_cmd = manager.clone();
-            tauri::async_runtime::spawn(async move {
+            tokio::spawn(async move {
                 let res = mgr_cmd
                     .execute_command(
                         PhoneCommand::StartStream {
@@ -462,7 +488,7 @@ async fn process_incoming_message(text: &str, manager: &PhoneManager) {
                     )
                     .await;
                 if let Err(e) = res {
-                    let _ = mgr_cmd.app.emit("phone-error", json!({ "error": format!("Screen stream didn't start: {e}") }));
+                    mgr_cmd.events.emit("phone-error", &json!({ "error": format!("Screen stream didn't start: {e}") }));
                 }
             });
         }
@@ -474,7 +500,7 @@ async fn process_incoming_message(text: &str, manager: &PhoneManager) {
             if screen_share.is_some() {
                 state.screen_share = screen_share;
             }
-            let _ = manager.app.emit("phone-status", state.clone());
+            manager.events.emit("phone-status", &*state);
         }
         PhoneMessage::Frame { data, .. } => {
             manager.store_frame(data).await;
@@ -506,33 +532,29 @@ async fn process_incoming_message(text: &str, manager: &PhoneManager) {
             state.battery_level = battery_level;
             state.is_charging = is_charging;
             state.last_seen = chrono::Utc::now().timestamp_millis() as u64;
-            let _ = manager.app.emit("phone-status", state.clone());
+            manager.events.emit("phone-status", &*state);
         }
         PhoneMessage::Heartbeat { .. } => {
             manager.device_state.write().await.last_seen = chrono::Utc::now().timestamp_millis() as u64;
         }
         PhoneMessage::Error { message } => {
-            let _ = manager.app.emit("phone-error", json!({ "error": message }));
+            manager.events.emit("phone-error", &json!({ "error": message }));
         }
         PhoneMessage::CrashReport { report } => {
             // Keep the full trace on disk for diagnosis; the UI gets a short note.
-            if let Ok(dir) = std::env::var("LOCALAPPDATA") {
-                let dir = std::path::PathBuf::from(dir).join("Vivy");
-                let _ = std::fs::create_dir_all(&dir);
-                if let Ok(mut f) = std::fs::OpenOptions::new()
-                    .create(true)
-                    .append(true)
-                    .open(dir.join("phone-crash.log"))
-                {
+            let path = crate::paths::data_path("phone-crash.log");
+            if let Some(path) = &path {
+                if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
                     use std::io::Write;
                     let _ = writeln!(f, "{report}
 ----");
                 }
             }
             let first = report.lines().nth(1).unwrap_or("").trim().to_string();
-            let _ = manager.app.emit(
+            let saved = path.map(|p| format!(" Details saved in {}.", p.display())).unwrap_or_default();
+            manager.events.emit(
                 "phone-error",
-                json!({ "error": format!("The phone app crashed earlier ({first}). Details saved in %LOCALAPPDATA%\\Vivy\\phone-crash.log.") }),
+                &json!({ "error": format!("The phone app crashed earlier ({first}).{saved}") }),
             );
         }
     }

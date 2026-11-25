@@ -1,0 +1,32 @@
+name: CLI
+
+# Builds and tests the engine and the `vivy` terminal app on Linux and
+# Windows, and keeps the binaries as downloadable artifacts.
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            bin: vivy
+          - os: windows-latest
+            bin: vivy.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Test
+        run: cargo test -p vivy-core -p vivy-cli --locked
+      - name: Build
+        run: cargo build --release -p vivy-cli --locked
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vivy-cli-${{ runner.os }}
+          path: target/release/${{ matrix.bin }}

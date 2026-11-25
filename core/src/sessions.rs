@@ -1,6 +1,6 @@
 //! Chat sessions: each one keeps its activity log (what the UI shows) and the
 //! conversation the model remembers (turns + a compacted summary).
-//! Stored as one JSON file per session in %LOCALAPPDATA%\Vivy\sessions.
+//! Stored as one JSON file per session in the `sessions` folder of the data folder.
 
 use std::path::PathBuf;
 use std::sync::Mutex;
@@ -94,7 +94,7 @@ fn title_from(prompt: &str) -> String {
 impl SessionStore {
     /// Opens the store on a fresh chat; earlier chats stay in the list.
     pub fn load() -> Self {
-        let dir = std::env::var("LOCALAPPDATA").ok().map(|d| PathBuf::from(d).join("Vivy").join("sessions"));
+        let dir = crate::paths::data_path("sessions");
         if let Some(d) = &dir {
             let _ = std::fs::create_dir_all(d);
         }

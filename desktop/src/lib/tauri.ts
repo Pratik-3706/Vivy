@@ -120,6 +120,15 @@ export const tauriApi = {
   /** Unpair the phone and disconnect it. */
   forgetPhone: (): Promise<PairingView> => invoke('forget_phone'),
 
+  /** 'allowed' | 'blocked' | 'missing' | 'unknown' */
+  checkFirewall: (): Promise<string> => invoke('check_firewall'),
+
+  /** Shows the Windows admin prompt, then returns the new status. */
+  allowFirewall: (): Promise<string> => invoke('allow_firewall'),
+
+  onPhoneFirewall: (cb: (status: string) => void): Promise<UnlistenFn> =>
+    listen<{ status: string }>('phone-firewall', (e) => cb(e.payload.status)),
+
   onPairingChanged: (cb: (p: PairingView) => void): Promise<UnlistenFn> =>
     listen<PairingView>('pairing-changed', (e) => cb(e.payload)),
 };

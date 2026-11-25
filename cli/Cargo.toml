@@ -1,0 +1,22 @@
+[package]
+name = "vivy-cli"
+version = "0.1.0"
+description = "Vivy in the terminal: tell your Android phone what to do, with a pixel Matsumoto"
+edition = "2021"
+license = "MIT"
+
+[[bin]]
+name = "vivy"
+path = "src/main.rs"
+
+[dependencies]
+vivy-core = { path = "../core" }
+clap = { version = "4", features = ["derive"] }
+crossterm = "0.28"
+rustyline = "14"
+rpassword = "7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+chrono = "0.4"

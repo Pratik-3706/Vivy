@@ -10,7 +10,7 @@ use std::time::Instant;
 
 #[tokio::main]
 async fn main() {
-    let creds = desktop_lib::security::load_credentials_securely();
+    let creds = vivy_core::security::load_credentials_securely();
     if creds.api_key().is_empty() {
         eprintln!("No API key saved in Vivy settings.");
         return;
@@ -46,7 +46,7 @@ async fn main() {
         ]
     });
     if with_tools {
-        body["tools"] = Value::Array(desktop_lib::agent::tools::get_agent_tools_schema());
+        body["tools"] = Value::Array(vivy_core::agent::tools::get_agent_tools_schema());
         body["tool_choice"] = json!("auto");
     }
 

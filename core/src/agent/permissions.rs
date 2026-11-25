@@ -1,9 +1,10 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
-use tauri::{AppHandle, Emitter};
 use tokio::sync::{oneshot, Mutex};
 use uuid::Uuid;
+
+use crate::events::Events;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -40,15 +41,15 @@ pub struct PermissionRequest {
 
 #[derive(Clone)]
 pub struct PermissionManager {
-    app: AppHandle,
+    events: Events,
     granted_categories: Arc<Mutex<HashSet<PermissionCategory>>>,
     pending_requests: Arc<Mutex<HashMap<String, oneshot::Sender<bool>>>>,
 }
 
 impl PermissionManager {
-    pub fn new(app: AppHandle) -> Self {
+    pub fn new(events: Events) -> Self {
         Self {
-            app,
+            events,
             granted_categories: Arc::new(Mutex::new(HashSet::new())),
             pending_requests: Arc::new(Mutex::new(HashMap::new())),
         }
@@ -87,7 +88,7 @@ impl PermissionManager {
         };
 
         // Notify UI to display interactive permission modal
-        let _ = self.app.emit("agent-permission-request", &req);
+        self.events.emit("agent-permission-request", &req);
 
         // Await user's choice in desktop dashboard (up to 120 seconds timeout)
         match tokio::time::timeout(std::time::Duration::from_secs(120), rx).await {
@@ -107,7 +108,7 @@ impl PermissionManager {
         }
     }
 
-    /// Called by Tauri command when user clicks "Allow" or "Deny" in dashboard
+    /// Called when the user answers the prompt (Allow / Deny in the app, y / n in the terminal).
     pub async fn respond_to_request(&self, request_id: &str, allowed: bool) -> bool {
         let mut pending = self.pending_requests.lock().await;
         if let Some(sender) = pending.remove(request_id) {
@@ -130,6 +131,6 @@ impl PermissionManager {
         for (_, sender) in drained {
             let _ = sender.send(false);
         }
-        let _ = self.app.emit("agent-permission-cancelled", ());
+        self.events.emit("agent-permission-cancelled", &());
     }
 }

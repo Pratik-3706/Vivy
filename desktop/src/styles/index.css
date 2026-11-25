@@ -2278,3 +2278,14 @@ body.resizing * {
 .phone-row .link.danger {
   color: var(--danger);
 }
+
+/* Windows Firewall warning in the pairing panel */
+.firewall-banner {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 10px;
+}
+.firewall-error {
+  color: var(--text-2);
+}
